@@ -21,15 +21,59 @@ class ModelConfig:
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # TODO: Implement the CausalSelfAttention class with RoPE positional Embedding
-        # Attributes that could possibly be used: config.n_embd, config.n_head, config.dropout, config.bias
-        pass
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_size = config.n_embd // config.n_head
+        assert self.head_size % 2 == 0, "RoPE requires an even per-head dimension"
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_size, 2).float() / self.head_size))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size))
+            .view(1, 1, config.block_size, config.block_size),
+        )
+
+    def _apply_rope(self, x):
+        B, H, L, D = x.size()
+        positions = torch.arange(L, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(positions, self.inv_freq.to(x.device))
+        cos = freqs.cos().to(dtype=x.dtype).view(1, 1, L, D // 2)
+        sin = freqs.sin().to(dtype=x.dtype).view(1, 1, L, D // 2)
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rotated = torch.empty_like(x)
+        x_rotated[..., 0::2] = x_even * cos - x_odd * sin
+        x_rotated[..., 1::2] = x_even * sin + x_odd * cos
+        return x_rotated
 
     def forward(self, x):
         # shape of x: B, L, C
         # shape of output: B, L, C
-        # TODO: Implement the CausalSelfAttention class
-        pass
+        B, L, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
+        q = q.view(B, L, self.n_head, self.head_size).transpose(1, 2)
+        k = k.view(B, L, self.n_head, self.head_size).transpose(1, 2)
+        v = v.view(B, L, self.n_head, self.head_size).transpose(1, 2)
+
+        q = self._apply_rope(q)
+        k = self._apply_rope(k)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
+        att = att.masked_fill(self.bias[:, :, :L, :L] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, L, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 class MLP(nn.Module):
     def __init__(self, config):

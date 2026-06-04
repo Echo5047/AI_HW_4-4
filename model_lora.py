@@ -14,15 +14,49 @@ class LoRALinear(nn.Module):
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r if r > 0 else 0.0
         
-        # TODO: 1. Initialize self.linear as a standard nn.Linear and freeze its weights (requires_grad = False)
-        # TODO: 2. If r > 0, register self.lora_A and self.lora_B as learnable parameters (nn.Parameter)
-        # TODO: 3. Initialize lora_A with random normal distribution (std = 1/sqrt(r)) and lora_B with zeros
-        pass
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        for param in self.linear.parameters():
+            param.requires_grad = False
+
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.empty(in_features, r))
+            self.lora_B = nn.Parameter(torch.empty(r, out_features))
+            nn.init.normal_(self.lora_A, mean=0.0, std=1.0 / math.sqrt(r))
+            nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        legacy_weight_key = prefix + "weight"
+        legacy_bias_key = prefix + "bias"
+        linear_weight_key = prefix + "linear.weight"
+        linear_bias_key = prefix + "linear.bias"
+
+        if legacy_weight_key in state_dict and linear_weight_key not in state_dict:
+            state_dict[linear_weight_key] = state_dict.pop(legacy_weight_key)
+        if legacy_bias_key in state_dict and linear_bias_key not in state_dict:
+            state_dict[linear_bias_key] = state_dict.pop(legacy_bias_key)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+        # Plain GPT checkpoints do not contain LoRA parameters. Keep the random/zero
+        # initialization above when loading such a base checkpoint for finetuning.
+        if legacy_weight_key in state_dict or linear_weight_key in state_dict:
+            for lora_key in (prefix + "lora_A", prefix + "lora_B"):
+                if lora_key in missing_keys:
+                    missing_keys.remove(lora_key)
 
     def forward(self, x):
-        # TODO: Implement the forward pass incorporating LoRA
         # Formula: output = linear(x) + scaling * (x @ lora_A @ lora_B)
-        pass
+        out = self.linear(x)
+        if self.r > 0:
+            out = out + self.scaling * (x @ self.lora_A @ self.lora_B)
+        return out
 
 class CausalSelfAttentionLoRA(nn.Module):
     def __init__(self, config):
@@ -42,9 +76,22 @@ class CausalSelfAttentionLoRA(nn.Module):
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        # TODO: Implement the CausalSelfAttention process (similar to Task 4.2)
-        # Make sure to use self.c_attn(x) to get q, k, v and apply the rest of attention mechanisms
-        pass
+        B, L, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        head_size = C // self.n_head
+
+        q = q.view(B, L, self.n_head, head_size).transpose(1, 2)
+        k = k.view(B, L, self.n_head, head_size).transpose(1, 2)
+        v = v.view(B, L, self.n_head, head_size).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_size))
+        att = att.masked_fill(self.bias[:, :, :L, :L] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, L, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class BlockLoRA(nn.Module):
