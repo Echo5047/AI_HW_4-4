@@ -21,15 +21,38 @@ class ModelConfig:
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # TODO: Implement the CausalSelfAttention class
-        # Attributes that could possibly be used: config.n_embd, config.n_head, config.dropout, config.bias
-        pass
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size))
+            .view(1, 1, config.block_size, config.block_size),
+        )
 
     def forward(self, x):
         # shape of x: B, L, C
         # shape of output: B, L, C
-        # TODO: Implement the CausalSelfAttention class
-        pass
+        B, L, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        head_size = C // self.n_head
+
+        q = q.view(B, L, self.n_head, head_size).transpose(1, 2)
+        k = k.view(B, L, self.n_head, head_size).transpose(1, 2)
+        v = v.view(B, L, self.n_head, head_size).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_size))
+        att = att.masked_fill(self.bias[:, :, :L, :L] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, L, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -204,6 +227,26 @@ class GPT(nn.Module):
             top_k: top-k filtering (int)
             top_p: top-p (nucleus) sampling (float, in [0, 1])
         """
-        pass
-        # TODO: Implement text generation with top-p (nucleus) sampling.
-        # top_p: top-p (nucleus) sampling (float, in [0, 1])
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in the interval (0, 1]")
+
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
+
+            filtered_probs = F.softmax(sorted_logits, dim=-1)
+            sampled_sorted_idx = torch.multinomial(filtered_probs, num_samples=1)
+            idx_next = sorted_indices.gather(-1, sampled_sorted_idx)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx

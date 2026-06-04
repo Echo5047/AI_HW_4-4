@@ -182,8 +182,16 @@ while iter_num <= max_iters:
     if iter_num == 0 and eval_only:
         break
 
-    # TODO: Implement the gradient accumulation process
-    # accumulate the gradient with several forward-backward process, then call optimizer.step() to update model parameters
+    optimizer.zero_grad(set_to_none=True)
+    for micro_step in range(gradient_accumulation_steps):
+        logits, loss = model(X, Y)
+        X, Y = get_batch('train')
+        loss = loss / gradient_accumulation_steps
+        loss.backward()
+
+    if grad_clip != 0.0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
 
     t1 = time.time()
     if iter_num % log_interval == 0:
